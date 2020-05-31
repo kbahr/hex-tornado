@@ -95,7 +95,7 @@ async function generateMerkleProof(contract, deposit) {
     .sort((a, b) => a.returnValues.leafIndex - b.returnValues.leafIndex) // Sort events in chronological order
     .map(e => e.returnValues.commitment)
   const tree = new merkleTree(MERKLE_TREE_HEIGHT, leaves)
-
+  
   // Find current commitment in the tree
   let depositEvent = events.find(e => e.returnValues.commitment === toHex(deposit.commitment))
   let leafIndex = depositEvent ? depositEvent.returnValues.leafIndex : -1
@@ -249,14 +249,14 @@ async function init() {
     const seed = readline.question("Please enter your wallet seed (needed each time): ");
     const provider = new HDWalletProvider(
       seed,
-      'http://ethereum-rpc.trustwalletapp.com'
+      'https://ethereum-rpc.trustwalletapp.com'
     );
     
     web3 = new Web3(provider);
     circuit = require('./build/circuits/withdraw.json')
     proving_key = fs.readFileSync('build/circuits/withdraw_proving_key.bin').buffer
     require('dotenv').config()
-    MERKLE_TREE_HEIGHT = process.env.MERKLE_TREE_HEIGHT
+    MERKLE_TREE_HEIGHT = process.env.MERKLE_TREE_HEIGHT || 20
     ETH_AMOUNT = process.env.ETH_AMOUNT
     TOKEN_AMOUNT = process.env.TOKEN_AMOUNT
     ERC20_TOKEN = process.env.ERC20_TOKEN
