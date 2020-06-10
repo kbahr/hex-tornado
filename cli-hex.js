@@ -17,15 +17,18 @@ const websnarkUtils = require('websnark/src/utils')
 const { toWei, fromWei } = require('web3-utils')
 
 // erc20tornado
-let web3, tenKHex, hundredKHex, millionHex, circuit, proving_key, groth16, erc20, senderAccount
+let web3, tenKHex, hundredKHex, millionHex, circuit, proving_key, groth16, erc20, senderAccount, sessionNetId
 let MERKLE_TREE_HEIGHT, TOKEN_AMOUNT, ERC20_TOKEN
 
 const tornados = {};
 
 const fullNumber = {
   "10k": "Ten Thousand",
+  "1000000000000" : "Ten Thousand",
   "100k": "One Hundred Thousand",
-  "1000k": "One Million"
+  "10000000000000" : "One Hundred Thousand",
+  "1000k": "One Million",
+  "100000000000000" : "One Million"
 }
 
 /** Whether we are in a browser or node.js */
@@ -61,23 +64,48 @@ function createDeposit(nullifier, secret) {
 }
 
 /**
+ * 
+ * parses the network id, amount, and note itsef from the notestring
+ */
+function parseNote(noteString) {
+  const noteRegex = /hexmix-(?<amount>[\d.]+)-(?<netId>\d+)-0x(?<note>[0-9a-fA-F]{124})/g
+  const match = noteRegex.exec(noteString)
+  if (!match) {
+    throw new Error('The note has invalid format')
+  }
+
+  const buf = Buffer.from(match.groups.note, 'hex')
+  const nullifier = bigInt.leBuff2int(buf.slice(0, 31))
+  const secret = bigInt.leBuff2int(buf.slice(31, 62))
+  const deposit = createDeposit(nullifier, secret)
+  const netId = Number(match.groups.netId)
+
+  return { amount: match.groups.amount, netId, deposit }
+}
+
+/**
  * Make an ERC20 deposit
  */
 async function depositErc20(erc20tornado) {
   const deposit = createDeposit(rbigint(31), rbigint(31))
 
   const note = toHex(deposit.preimage, 62)
+  const noteString = `hexmix-${erc20tornado.tokenAmount}-${sessionNetId}-${note}`;
   console.log('Your commitment:', deposit.commitment)
-  console.log('Your note:', note)
+  console.log('Your note:', noteString)
   readline.keyIn("Record your note. You will need it to withdraw. When recorded, press any key to continue...");
 
-  console.log(`Approving ${erc20tornado.tokenAmount} tokens for deposit`)
-  await erc20.methods.approve(erc20tornado._address, erc20tornado.tokenAmount).send({ from: senderAccount, gas:1e6 })
-
+  const allowance = await erc20.methods.allowance(senderAccount, erc20tornado._address).send({from: senderAccount});
+  console.log(`Current allowance is ${allowance}`);
+  if(allowance.lt(erc20tornado.tokenAmount)){
+    console.log(`Approving ${erc20tornado.tokenAmount} tokens for deposit`)
+    await erc20.methods.approve(erc20tornado._address, erc20tornado.tokenAmount).send({ from: senderAccount})
+  }
+  
   console.log('Submitting deposit transaction')
   await erc20tornado.methods.deposit(toHex(deposit.commitment)).send({ from: senderAccount, gas:2e6 })
 
-  return note
+  return noteString
 }
 
 /**
@@ -120,10 +148,10 @@ async function generateMerkleProof(contract, deposit) {
  * @param fee Relayer fee
  * @param refund Receive ether for exchanged tokens
  */
-async function generateProof(contract, note, recipient, relayer = 0, fee = 0, refund = 0) {
+async function generateProof(contract, deposit, recipient, relayer = 0, fee = 0, refund = 0) {
   // Decode hex string and restore the deposit object
-  let buf = Buffer.from(note.slice(2), 'hex')
-  let deposit = createDeposit(bigInt.leBuff2int(buf.slice(0, 31)), bigInt.leBuff2int(buf.slice(31, 62)))
+  // let buf = Buffer.from(note.slice(2), 'hex')
+  // let deposit = createDeposit(bigInt.leBuff2int(buf.slice(0, 31)), bigInt.leBuff2int(buf.slice(31, 62)))
 
   // Compute merkle proof of our commitment
   const { root, path_elements, path_index } = await generateMerkleProof(contract, deposit)
@@ -168,9 +196,11 @@ async function generateProof(contract, note, recipient, relayer = 0, fee = 0, re
  * @param note Note to withdraw
  * @param recipient Recipient address
  */
-async function withdrawErc20(erc20tornado, note, recipient) {
+async function withdrawErc20(erc20tornado, deposit, recipient) {
+  
   if(readline.keyInYN(`Do you wish to withdraw to ${recipient}? (y/n)`)){
-    const { proof, args } = await generateProof(erc20tornado, note, recipient)
+    
+    const { proof, args } = await generateProof(erc20tornado, deposit, recipient)
 
     console.log('Submitting withdraw transaction')
     await erc20tornado.methods.withdraw(proof, ...args).send({ from: senderAccount, gas: 1e6 })
@@ -186,7 +216,7 @@ async function withdrawErc20(erc20tornado, note, recipient) {
  * @param recipient Recipient address
  * @param relayUrl Relay url address
  */
-async function withdrawRelayErc20(erc20tornado, note, recipient, relayUrl) {
+async function withdrawRelayErc20(erc20tornado, deposit, recipient, relayUrl) {
   const resp = await axios.get(relayUrl + '/status')
   const { relayerAddress, netId, gasPrices, ethPriceInDai } = resp.data
   assert(netId === await web3.eth.net.getId() || netId === '*', 'This relay is for different network')
@@ -194,7 +224,7 @@ async function withdrawRelayErc20(erc20tornado, note, recipient, relayUrl) {
 
   const refund = bigInt(toWei('0.001'))
   const fee = bigInt(toWei(gasPrices.fast.toString(), 'gwei')).mul(bigInt(1e6)).add(refund).mul(bigInt(fromWei(ethPriceInDai.toString())))
-  const { proof, args } = await generateProof(erc20tornado, note, recipient, relayerAddress, fee, refund)
+  const { proof, args } = await generateProof(erc20tornado, deposit, recipient, relayerAddress, fee, refund)
 
   console.log('Sending withdraw transaction through relay')
   const resp2 = await axios.post(relayUrl + '/relay', { contract: erc20tornado._address, proof: { proof, publicSignals: args } })
@@ -266,7 +296,7 @@ async function init() {
   
   groth16 = await buildGroth16()
   //let netId = await web3.eth.net.getId()
-  let netId = 1;
+  sessionNetId = 1;
 
   erc20DenominationsJson = require('./scripts/tornado-deployments.json');
 
@@ -287,14 +317,19 @@ async function init() {
 
 
   tornados["10k"] = tenKHex;
+  tornados[tenKHex.tokenAmount] = tenKHex;
+
   tornados["100k"] = hundredKHex;
+  tornados[hundredKHex.tokenAmount] = hundredKHex;
+
   tornados["1000k"] = millionHex;
+  tornados[millionHex.tokenAmount] = millionHex;
   // const tx3 = await web3.eth.getTransaction(erc20tornadoJson.networks[netId].transactionHash)
   // erc20tornado = new web3.eth.Contract(erc20tornadoJson.abi, erc20tornadoJson.networks[netId].address)
   // erc20tornado.deployedBlock = tx3.blockNumber
   
-  erc20 = new web3.eth.Contract(erc20ContractJson.abi, erc20ContractJson.networks[netId].address)
-  const tx2 = await web3.eth.getTransaction(erc20ContractJson.networks[netId].transactionHash)
+  erc20 = new web3.eth.Contract(erc20ContractJson.abi, erc20ContractJson.networks[sessionNetId].address)
+  const tx2 = await web3.eth.getTransaction(erc20ContractJson.networks[sessionNetId].transactionHash)
   erc20.deployedBlock = tx2.blockNumber
 
   senderAccount = (await web3.eth.getAccounts())[0]
@@ -318,7 +353,7 @@ function printHelp(code = 0) {
   $ ./cli-hex.js depositErc20 <10k|100k|1000k>
 
   Withdraw an existing note to 'recipient' account
-  $ ./cli-hex.js withdrawErc20 <10k|100k|1000k> <note> <recipient> [relayUrl]
+  $ ./cli-hex.js withdrawErc20 <note> <recipient> [relayUrl]
 
   Check address balance
   $ ./cli-hex.js balance <address>
@@ -377,52 +412,63 @@ async function runConsole(args) {
       break
     case 'withdrawErc20':
       
-      if (args.length >= 4 && 
-          args.length <= 5 && 
-          /^0x[0-9a-fA-F]{124}$/.test(args[2]) && 
-          /^0x[0-9a-fA-F]{40}$/.test(args[3])) {
+      if (args.length >= 3 && 
+          args.length <= 4 && 
+          ///^0x[0-9a-fA-F]{124}$/.test(args[1]) && 
+          /^0x[0-9a-fA-F]{40}$/.test(args[2])) {
         await init()
-        const erc20tornado = tornados[args[1]];
+        const {amount, netId, deposit } = parseNote(args[1]);
+        const erc20tornado = tornados[amount];
+        console.log(`Lookup for tornado with amount ${amount} and keys\n${Object.keys(tornados)}\n ${erc20tornado ? "succeeded" : "failed"}`);
+        if(sessionNetId !== netId){
+          throw `This note is for a different network: ${sessionNetId} vs ${netId}`;
+        }
+
         if(!erc20tornado){printHelp(1);}
 
-        const confirmed = await confirm(args[1], "withdraw")
+        const confirmed = await confirm(amount, "withdraw")
         if(!confirmed){
           console.log('Exiting without taking action...');
           return;
         }
         await printBalance(erc20tornado._address, 'Tornado')
-        await printBalance(args[3], 'Recipient account')
-        if (args[4]) {
-          await withdrawRelayErc20(erc20tornado, args[2], args[3], args[4])
+        await printBalance(args[2], 'Recipient account')
+        if (args[3]) {
+          await withdrawRelayErc20(erc20tornado, deposit, args[2], args[3])
         } else {
-          await withdrawErc20(erc20tornado, args[2], args[3])
+          await withdrawErc20(erc20tornado, deposit, args[2])
         }
         await printBalance(erc20tornado._address, 'Tornado')
-        await printBalance(args[3], 'Recipient account')
+        await printBalance(args[2], 'Recipient account')
       } else {
         printHelp(1)
       }
       break
-    case 'test':
-      if (args.length === 1) {
-        await init()
+      // Tests broken for the moment
+    // case 'test':
+    //   if (args.length === 1) {
+    //     await init()
 
-        const note2 = await depositErc20()
-        await withdrawErc20(note2, senderAccount)
-      } else {
-        printHelp(1)
-      }
-      break
-    case 'testRelay':
-      if (args.length === 1) {
-        await init()
+    //     const note2 = await depositErc20()
+    //     const {amount, noteNetId, note2note } = parseNote(note2);
+    //     const erc20tornado = tornados[amount];
+    //     await withdrawErc20(erc20tornado, note2note, senderAccount)
+    //   } else {
+    //     printHelp(1)
+    //   }
+    //   break
+    // case 'testRelay':
+    //   if (args.length === 1) {
+    //     await init()
 
-        const note2 = await depositErc20()
-        await withdrawRelayErc20(note2, senderAccount, 'http://localhost:8000')
-      } else {
-        printHelp(1)
-      }
-      break
+    //     const note2 = await depositErc20()
+    //     const {amount, noteNetId, note2note } = parseNote(note2);
+    //     const erc20tornado = tornados[amount];
+    //     await withdrawRelayErc20(erc20tornado, note2note, senderAccount, 'http://localhost:8000')
+    //   } else {
+    //     printHelp(1)
+    //   }
+    //   break
 
     default:
       printHelp(1)
